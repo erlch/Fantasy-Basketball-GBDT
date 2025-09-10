@@ -13,7 +13,7 @@ You'll need Python (3.7+) and the following packages:
 * `scikit-learn`
 * `tqdm` (progress bar)
 
-For this project, we will be using game log data from KaggleHub, specifically the [2023-24](https://www.kaggle.com/datasets/joopaivaaaaaaa/nba-gamelogs-2023-24) and [2024-25](https://www.kaggle.com/datasets/joopaivaaaaaaa/nba-gamelogs-2024-25) NBA seasons, to build a dataset for fantasy basketball analysis.
+For this project, we will be using game log data from KaggleHub, specifically the [2022-23, 2023-24 and 2024-25](https://www.kaggle.com/datasets/eoinamoore/historical-nba-data-and-player-box-scores) NBA seasons, to build a dataset for fantasy basketball analysis.
 """
 
 pip install pandas lightgbm scikit-learn tqdm
@@ -283,7 +283,7 @@ fowards_centers = player_ranks[player_ranks["position"].isin(["F-C", "C-F"])].so
 centers = player_ranks[player_ranks["position"] == "C"].sort_values(by="predictedFantasyPoints", ascending=False).reset_index(drop=True)
 
 print("Top Players:")
-print(players.head(25)[["playerName", "predictedFantasyPoints"]])
+print(players.head(50)[["playerName", "predictedFantasyPoints"]])
 
 print("\nTop Guards:")
 print(guards.head(10)[["playerName", "predictedFantasyPoints"]])
