@@ -25,6 +25,7 @@ import unicodedata
 from tqdm import tqdm
 import os
 import lightgbm as lgb
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,6 +68,13 @@ FANTASY_SCORING = {
 These functions are used to prepare and process the raw NBA data before training the model:
 
 `compute_fantasy_points` – Calculates player's fantasy points for given game using the default ESPN Fantasy Basketball scoring system. These fantasy points serve as the target variable for the model.
+
+`calculate_experience_curve` - Calculates an adjustment factor based on the number of seasons a player has been in the NBA. This feature models expected player growth and regression over the course of their career:
+
+* **0–4 years**: Improvement phase (steep growth)
+* **5–8 years**: Peak years (stable performance)
+* **9–12 years**: Gradual regression
+* **13+ years**: Late-career decline
 """
 
 def compute_fantasy_points(df):
@@ -92,6 +100,19 @@ def compute_fantasy_points(df):
 
     return df
 
+def calculate_experience_curve(seasons):
+    """
+    Calculate experience curve for a player based on seasons played.
+    """
+    if seasons <= 4:
+        return 1 + 0.05 * (4 - seasons)
+    elif 5 <= seasons <= 8:
+        return 1
+    elif 9 <= seasons <= 12:
+        return 1 - 0.02 * (seasons - 8)
+    else:
+        return 0.85 - 0.03 * (seasons - 12)
+
 """# **Build dataset for all active NBA players**
 
 Let's prepare the dataset for all active NBA players that will be used to train our Gradient Boosting Decision Tree (GBDT) model.
@@ -112,7 +133,7 @@ df = pd.read_csv(csv)
 df["gameDate"] = pd.to_datetime(df["gameDate"])
 
 df_players = pd.read_csv(players_csv)
-df_players.rename(columns={"PERSON_ID": "personId", "POSITION": "position"}, inplace=True)
+df_players.rename(columns={"PERSON_ID": "personId", "POSITION": "position", "FROM_YEAR": "fromYear"}, inplace=True)
 
 print(df_players.head())
 
@@ -137,7 +158,7 @@ dataframes = [df_22_23, df_23_24, df_24_25]
 
 for i, df_season in enumerate(dataframes):
     dataframes[i] = df_season.merge(
-        df_players[["personId", "position"]],
+        df_players[["personId", "position", "fromYear"]],
         on="personId",
         how="left"
     )
@@ -161,7 +182,7 @@ print(df_24_25.head())
 
 # Define relevant columns to keep
 cols_to_keep = [
-    "playerName", "playerteamName", "position",
+    "personId", "playerName", "playerteamName", "position", "fromYear",
     "points", "threePointersMade", "fieldGoalsAttempted",
     "fieldGoalsMade", "freeThrowsAttempted", "freeThrowsMade",
     "reboundsTotal", "assists", "steals", "blocks", "turnovers"
@@ -170,13 +191,13 @@ cols_to_keep = [
 # Ensure numeric columns
 numeric_cols = ["points", "threePointersMade", "fieldGoalsAttempted",
     "fieldGoalsMade", "freeThrowsAttempted", "freeThrowsMade",
-    "reboundsTotal", "assists", "steals", "blocks", "turnovers"]
+    "reboundsTotal", "assists", "steals", "blocks", "turnovers", "fromYear"]
 
 df_22_23[numeric_cols] = df_22_23[numeric_cols].apply(pd.to_numeric, errors="coerce")
 df_23_24[numeric_cols] = df_23_24[numeric_cols].apply(pd.to_numeric, errors="coerce")
 df_24_25[numeric_cols] = df_24_25[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
-# Load CSVs into Pandas with only columns we want to keep
+# Keep only columns we want
 df_22_23 = df_22_23[cols_to_keep]
 df_22_23["seasonYear"] = "2022-23"
 
@@ -186,15 +207,35 @@ df_23_24["seasonYear"] = "2023-24"
 df_24_25 = df_24_25[cols_to_keep]
 df_24_25["seasonYear"] = "2024-25"
 
+# Calculate seasons played and experience factor
+df_22_23["seasonsPlayed"] = df_22_23["seasonYear"].str.split("-").str[0].astype(int) - df_22_23["fromYear"] + 1
+df_22_23["experienceFactor"] = df_22_23["seasonsPlayed"].apply(calculate_experience_curve)
+
+df_23_24["seasonsPlayed"] = df_23_24["seasonYear"].str.split("-").str[0].astype(int) - df_23_24["fromYear"] + 1
+df_23_24["experienceFactor"] = df_23_24["seasonsPlayed"].apply(calculate_experience_curve)
+
+df_24_25["seasonsPlayed"] = df_24_25["seasonYear"].str.split("-").str[0].astype(int) - df_24_25["fromYear"] + 1
+df_24_25["experienceFactor"] = df_24_25["seasonsPlayed"].apply(calculate_experience_curve)
+
 # Compute total and average Fantasy Points for each season separately
 df_22_23 = compute_fantasy_points(df_22_23)
 df_23_24 = compute_fantasy_points(df_23_24)
 df_24_25 = compute_fantasy_points(df_24_25)
 
 # Apply weights for each season
-df_22_23["seasonWeight"] = 0.2
-df_23_24["seasonWeight"] = 0.3
-df_24_25["seasonWeight"] = 0.6
+# 2024-25 season matters 3x more than 2022-23 season and 2x more than 2023-24 season
+x = 0.2
+y = 0.3
+z = 0.6
+
+scale = (x + y + z) / 3
+x_scaled = x / scale
+y_scaled = y / scale
+z_scaled = z / scale
+
+df_22_23['weightedFantasyPoints'] = df_22_23['fantasyPoints'] * x_scaled
+df_23_24['weightedFantasyPoints'] = df_23_24['fantasyPoints'] * y_scaled
+df_24_25['weightedFantasyPoints'] = df_24_25['fantasyPoints'] * z_scaled
 
 # Combine the datasets
 df = pd.concat([df_22_23, df_23_24, df_24_25], ignore_index=True)
@@ -203,47 +244,92 @@ df = df.sort_values(by="fantasyPoints", ascending=False).reset_index(drop=True)
 print(df.head())
 print("Dataset shape:", df.shape)
 
+# Compute average fantasy points for player over season
+season_avg = (
+    df.groupby(["personId", "playerName", "seasonYear"])["fantasyPoints"]
+    .mean()
+    .reset_index()
+    .rename(columns={"fantasyPoints": "fantasyPointsCurrSeason"})
+)
+
+# Sort to prepare for shift
+season_avg = season_avg.sort_values(["personId", "seasonYear"])
+
+# Get prior season’s fantasy points and change in points
+season_avg["fantasyPointsPrevSeason"] = season_avg.groupby("personId")["fantasyPointsCurrSeason"].shift(1)
+season_avg["fantasyPointsChange"] = season_avg["fantasyPointsCurrSeason"] - season_avg["fantasyPointsPrevSeason"]
+
+# Merge back into main df
+df = df.merge(
+    season_avg,
+    on=["personId", "playerName", "seasonYear"],
+    how="left"
+)
+
+print(df[["playerName", "seasonYear", "fantasyPointsPrevSeason", "fantasyPointsCurrSeason", "fantasyPointsChange"]].head())
+print("Dataset shape:", df.shape)
+
 """# **Train Gradient Boosting Model**
 
 A LightGBM regression model is trained to predict fantasy points per game using the dataset of NBA player stats we just built. LightGBM is a type of Gradient Boosting Decision Tree (GBDT) that works particularly well for structured tabular data like box scores.
 
-`num_boost_round=500` sets the maximum number of boosting iterations (trees) to learn complex patterns in the data.
+* `"learning_rate": 0.01` controls the step size at which the model updates its weights during the boosting process. Smaller values means model learns slower.
 
-`early_stopping_rounds=50` ensures training stops if the validation error does not improve for 50 consecutive iterations, helping prevent overfitting.
+* `"num_leaves": 127` controls the maximum leaves per tree. Higher number means more complex patterns get captured by model.
 
-`verbose_eval=100` prints progress every 100 iterations so we can monitor the model’s performance.
+* `"feature_fraction": 0.8` means that 80% of features are randomly used for each split.
+
+* `"bagging_fraction": 0.8` means that 80% of the data will be used for training in each bagging iteration.
+
+* `"min_data_in_leaf": 20` sets the minimum number of samples required in one leaf.
+
+* `"bagging_freq": 5` determines the frequency that model performs bagging. Bagging is the combining of multiple independent models trained on different random subsets of the original data.
+
+* `num_boost_round=3000` sets the maximum number of boosting iterations (trees) to learn complex patterns in the data.
+
+* `early_stopping(stopping_rounds=100)` ensures training stops if the validation error does not improve for 100 consecutive iterations, helping prevent overfitting.
+
+* `log_evaluation(period=200)` prints progress every 200 iterations so we can monitor the model’s performance.
 
 After training, we evaluate the model using Root Mean Squared Error (RMSE), which measures how far the predicted fantasy points deviate from the actual values. A lower RMSE indicates better predictive accuracy.
 """
 
-X = df[numeric_cols]
-y = df["fantasyPoints"]
-weights = df["seasonWeight"]
+features = numeric_cols + [
+    "fantasyPointsCurrSeason",
+    "fantasyPointsPrevSeason",
+    "fantasyPointsChange",
+    "seasonsPlayed",
+    "experienceFactor"
+]
 
-X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
-    X, y, weights, test_size=0.2, random_state=42, shuffle=True
+# Create feature matrix and target
+X = df[features]
+y = df["weightedFantasyPoints"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, shuffle=True
 )
 
 # lgb refers to LightGBM, a popular gradient boosting framework from Microsoft
-train_data = lgb.Dataset(X_train, label=y_train, weight=w_train)
-test_data = lgb.Dataset(X_test, label=y_test, weight=w_test, reference=train_data)
+train_data = lgb.Dataset(X_train, label=y_train)
+test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
 
 params = {
     "objective": "regression",
     "metric": "rmse",
-    "learning_rate": 0.05,
-    "num_leaves": 31,
-    "feature_fraction": 0.9,
+    "learning_rate": 0.01,
+    "num_leaves": 127,
+    "feature_fraction": 0.8,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
-    "min_data_in_leaf": 5,
+    "min_data_in_leaf": 20,
     "verbose": -1
 }
 
 # Use a callback for early stopping
 callbacks = [
-    lgb.early_stopping(stopping_rounds=50),
-    lgb.log_evaluation(period=100)
+    lgb.early_stopping(stopping_rounds=100),
+    lgb.log_evaluation(period=200)
 ]
 
 # Train the model
@@ -251,7 +337,7 @@ model = lgb.train(
     params,
     train_data,
     valid_sets=[test_data],
-    num_boost_round=500,
+    num_boost_round=3000,
     callbacks=callbacks
 )
 
@@ -261,15 +347,20 @@ y_pred = model.predict(X_test, num_iteration=model.best_iteration)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 print("RMSE:", rmse)
 
+lgb.plot_importance(model, importance_type='gain')
+plt.title("Feature Importance (by Gain)")
+plt.show()
+
 """# **Get Player Rankings**
 
 This step produces the final rankings that can be used for fantasy basketball drafts or lineup decisions, taking into account player performance trends, positional roles, and season weights.
 """
 
-df["predictedFantasyPoints"] = model.predict(df[numeric_cols])
+df["predictedFantasyPoints"] = model.predict(df[features])
 player_ranks = df.groupby(["playerName"]).agg(
     predictedFantasyPoints=("predictedFantasyPoints", "mean"),
     fantasyPoints=("fantasyPoints", "mean"),
+    playerteamName=("playerteamName", "last"),
     position=("position", "last")
 ).reset_index()
 
@@ -283,20 +374,36 @@ fowards_centers = player_ranks[player_ranks["position"].isin(["F-C", "C-F"])].so
 centers = player_ranks[player_ranks["position"] == "C"].sort_values(by="predictedFantasyPoints", ascending=False).reset_index(drop=True)
 
 print("Top Players:")
-print(players.head(50)[["playerName", "predictedFantasyPoints"]])
+print(players.head(50)[["playerName", "playerteamName", "predictedFantasyPoints"]])
 
 print("\nTop Guards:")
-print(guards.head(10)[["playerName", "predictedFantasyPoints"]])
+print(guards.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
 
 print("\nTop Guards/Forwards:")
-print(guards_forwards.head(10)[["playerName", "predictedFantasyPoints"]])
+print(guards_forwards.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
 
 print("\nTop Forwards:")
-print(forwards.head(10)[["playerName", "predictedFantasyPoints"]])
+print(forwards.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
 
 print("\nTop Forwards/Centers:")
-print(fowards_centers.head(10)[["playerName", "predictedFantasyPoints"]])
+print(fowards_centers.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
 
 print("\nTop Centers:")
-print(centers.head(10)[["playerName", "predictedFantasyPoints"]])
+print(centers.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+
+# Sort players by predicted fantasy points
+players_sorted = player_ranks.sort_values(by='predictedFantasyPoints', ascending=True)
+
+# Select top N players for bar chart
+top_n = 20
+players_top = players_sorted.tail(top_n)
+
+# Plot horizontal bar chart
+plt.figure(figsize=(10, 8))
+plt.barh(players_top['playerName'], players_top['predictedFantasyPoints'], color='skyblue')
+plt.xlabel('Projected Fantasy Points')
+plt.ylabel('Player')
+plt.title(f'Top {top_n} Players - Projected Fantasy Points')
+plt.tight_layout()
+plt.show()
 
