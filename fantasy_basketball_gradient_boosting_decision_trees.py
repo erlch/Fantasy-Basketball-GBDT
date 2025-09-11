@@ -21,14 +21,11 @@ pip install pandas lightgbm scikit-learn tqdm
 import pandas as pd
 import numpy as np
 import kagglehub
-import unicodedata
-from tqdm import tqdm
 import os
 import lightgbm as lgb
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 """# **Fantasy Basketball Scoring**
 
@@ -75,6 +72,10 @@ These functions are used to prepare and process the raw NBA data before training
 * **5–8 years**: Peak years (stable performance)
 * **9–12 years**: Gradual regression
 * **13+ years**: Late-career decline
+
+`apply_season_weights` - Applies season weights to each players' fantasy points for each game. The 2024-25 season is weighted 3x relative to 2022-23 and 2x relative to 2023-24. The raw weights (0.2, 0.3, 0.6) are rescaled so that their average equals 1.0, ensuring weighted fantasy points remain on the same scale as the original values.
+
+`recommend_players` – Generates a draft recommendation by ranking a given list of players based on their projected fantasy points, positional roles, and recent performance trends. Limits the recommendation to a specified number of players (e.g., 4) to help prioritize selections in fantasy drafts or lineup decisions.
 """
 
 def compute_fantasy_points(df):
@@ -112,6 +113,48 @@ def calculate_experience_curve(seasons):
         return 1 - 0.02 * (seasons - 8)
     else:
         return 0.85 - 0.03 * (seasons - 12)
+
+def apply_season_weights(df_22_23, df_23_24, df_24_25):
+    """
+    Apply weights to each season's adjusted fantasy points.
+    """
+    x = 0.2
+    y = 0.3
+    z = 0.6
+
+    scale = (x + y + z) / 3
+    x_scaled = x / scale
+    y_scaled = y / scale
+    z_scaled = z / scale
+
+    df_22_23['weightedFantasyPoints'] = df_22_23['fantasyPoints'] * x_scaled
+    df_23_24['weightedFantasyPoints'] = df_23_24['fantasyPoints'] * y_scaled
+    df_24_25['weightedFantasyPoints'] = df_24_25['fantasyPoints'] * z_scaled
+
+    return df_22_23, df_23_24, df_24_25
+
+def recommend_players(player_list, df, model, features, top_n=4):
+    """
+    Recommend top players to pick from a list based on predicted fantasy points.
+    """
+    if len(player_list) > top_n:
+        raise ValueError(f"player_list can contain at most {top_n} players")
+
+    # Filter dataframe to only the players in the list
+    df_subset = df[df["playerName"].isin(player_list)].copy()
+
+    # Predict fantasy points for this subset
+    df_subset["predictedFantasyPoints"] = model.predict(df_subset[features])
+
+    # Aggregate by player (in case multiple rows per season/game)
+    df_subset = df_subset.groupby(["playerName", "playerteamName", "position"]).agg(
+        predictedFantasyPoints=("predictedFantasyPoints", "mean")
+    ).reset_index()
+
+    # Sort descending
+    df_subset = df_subset.sort_values(by="predictedFantasyPoints", ascending=False).reset_index(drop=True)
+
+    return df_subset
 
 """# **Build dataset for all active NBA players**
 
@@ -198,13 +241,13 @@ df_23_24[numeric_cols] = df_23_24[numeric_cols].apply(pd.to_numeric, errors="coe
 df_24_25[numeric_cols] = df_24_25[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
 # Keep only columns we want
-df_22_23 = df_22_23[cols_to_keep]
+df_22_23 = df_22_23[cols_to_keep].copy()
 df_22_23["seasonYear"] = "2022-23"
 
-df_23_24 = df_23_24[cols_to_keep]
+df_23_24 = df_23_24[cols_to_keep].copy()
 df_23_24["seasonYear"] = "2023-24"
 
-df_24_25 = df_24_25[cols_to_keep]
+df_24_25 = df_24_25[cols_to_keep].copy()
 df_24_25["seasonYear"] = "2024-25"
 
 # Calculate seasons played and experience factor
@@ -222,20 +265,8 @@ df_22_23 = compute_fantasy_points(df_22_23)
 df_23_24 = compute_fantasy_points(df_23_24)
 df_24_25 = compute_fantasy_points(df_24_25)
 
-# Apply weights for each season
-# 2024-25 season matters 3x more than 2022-23 season and 2x more than 2023-24 season
-x = 0.2
-y = 0.3
-z = 0.6
-
-scale = (x + y + z) / 3
-x_scaled = x / scale
-y_scaled = y / scale
-z_scaled = z / scale
-
-df_22_23['weightedFantasyPoints'] = df_22_23['fantasyPoints'] * x_scaled
-df_23_24['weightedFantasyPoints'] = df_23_24['fantasyPoints'] * y_scaled
-df_24_25['weightedFantasyPoints'] = df_24_25['fantasyPoints'] * z_scaled
+# Apply season weights to fantasy point values
+df_22_23, df_23_24, df_24_25 = apply_season_weights(df_22_23, df_23_24, df_24_25)
 
 # Combine the datasets
 df = pd.concat([df_22_23, df_23_24, df_24_25], ignore_index=True)
@@ -360,7 +391,6 @@ df["predictedFantasyPoints"] = model.predict(df[features])
 player_ranks = df.groupby(["playerName"]).agg(
     predictedFantasyPoints=("predictedFantasyPoints", "mean"),
     fantasyPoints=("fantasyPoints", "mean"),
-    playerteamName=("playerteamName", "last"),
     position=("position", "last")
 ).reset_index()
 
@@ -374,22 +404,22 @@ fowards_centers = player_ranks[player_ranks["position"].isin(["F-C", "C-F"])].so
 centers = player_ranks[player_ranks["position"] == "C"].sort_values(by="predictedFantasyPoints", ascending=False).reset_index(drop=True)
 
 print("Top Players:")
-print(players.head(50)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+print(players.head(50)[["playerName", "predictedFantasyPoints"]])
 
 print("\nTop Guards:")
-print(guards.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+print(guards.head(25)[["playerName", "predictedFantasyPoints"]])
 
 print("\nTop Guards/Forwards:")
-print(guards_forwards.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+print(guards_forwards.head(25)[["playerName", "predictedFantasyPoints"]])
 
 print("\nTop Forwards:")
-print(forwards.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+print(forwards.head(25)[["playerName", "predictedFantasyPoints"]])
 
 print("\nTop Forwards/Centers:")
-print(fowards_centers.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+print(fowards_centers.head(25)[["playerName", "predictedFantasyPoints"]])
 
 print("\nTop Centers:")
-print(centers.head(25)[["playerName", "playerteamName", "predictedFantasyPoints"]])
+print(centers.head(25)[["playerName", "predictedFantasyPoints"]])
 
 # Sort players by predicted fantasy points
 players_sorted = player_ranks.sort_values(by='predictedFantasyPoints', ascending=True)
@@ -406,4 +436,15 @@ plt.ylabel('Player')
 plt.title(f'Top {top_n} Players - Projected Fantasy Points')
 plt.tight_layout()
 plt.show()
+
+"""# **Recommendation System**
+
+This step allows users to input a small set of players (up to 4) and generates a ranked list based on predicted fantasy points. The recommendations leverage the trained gradient boosting model, accounting for player performance trends, positional roles, and season-adjusted fantasy projections to help inform optimal draft or lineup decisions.
+
+"""
+
+# Recommend which player to draft
+players_to_rank = ["LeBron James", "Ja Morant", "Cade Cunningham", "Anthony Edwards"]
+recommendations = recommend_players(players_to_rank, df, model, features)
+print(recommendations)
 
